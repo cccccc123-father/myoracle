@@ -1,0 +1,3 @@
+file,weighted,runs_ok,runs_fail,epsOK_rate,mae,gas_mean,gas_p50,gas_p95,gas_p99,reveals_mean
+"runs-1763384607789.jsonl","off",30,0,0.1333,208.87,1339011,1342747,1342898,1342898,5
+"runs-1763384840590.jsonl","off",10,0,0.2,240.1,1339884,1342045,1342755,1342755,5

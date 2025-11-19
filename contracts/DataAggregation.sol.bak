@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract DataAggregation {
+    /* ---------- Commitment storage ---------- */
+    // commitment = keccak256(abi.encodePacked(value, nonce, observer))
+    mapping(uint256 => mapping(address => bytes32)) public commitments;
+    event Committed(uint256 indexed requestId, address indexed observer, bytes32 commitment);
+
+    function storeCommitment(uint256 requestId, address observer, bytes32 commitment) external {
+        require(commitments[requestId][observer] == bytes32(0), "DA: already committed");
+        commitments[requestId][observer] = commitment;
+        emit Committed(requestId, observer, commitment);
+    }
+
+    function verifyReveal(uint256 requestId, address observer, uint256 value, uint256 nonce)
+        external
+        view
+        returns (bool)
+    {
+        bytes32 expected = keccak256(abi.encodePacked(value, nonce, observer));
+        return commitments[requestId][observer] == expected;
+    }
+
+    /* ---------- Simple (unweighted) consensus & anomaly detection ---------- */
+    // 注意：为了和 OracleCore 现有接口对齐，这里只拿到 values。
+    // 后续你可以改为带上 observers 或在本合约里维护 observers->weights。
+    function calculateWeightedConsensus(uint256 /*requestId*/, uint256[] calldata values)
+        external
+        pure
+        returns (uint256 consensus, uint256 lower, uint256 upper)
+    {
+        require(values.length > 0, "DA: no values");
+
+        // mean
+        uint256 sum;
+        for (uint i=0;i<values.length;i++) sum += values[i];
+        consensus = sum / values.length;
+
+        // std (population) in integer math
+        uint256 varSum;
+        for (uint i=0;i<values.length;i++) {
+            uint256 v = values[i] > consensus ? values[i] - consensus : consensus - values[i];
+            varSum += v * v;
+        }
+        uint256 variance = varSum / values.length;
+        uint256 std = _sqrt(variance);
+
+        // 95% CI ~ consensus ± 1.96*std  （粗略整数）
+        uint256 margin = (196 * std) / 100;
+        lower = consensus > margin ? consensus - margin : 0;
+        upper = consensus + margin;
+    }
+
+    // 返回“异常数量”：|v - consensus| > lambda * std
+    function detectAnomalies(
+        uint256 /*requestId*/,
+        uint256[] calldata values,
+        uint256 consensus,
+        uint256 lambdaTimes100  // 例如 250 表示 2.5σ
+    ) external pure returns (uint256 count) {
+        if (values.length == 0) return 0;
+        // 先算 std
+        uint256 varSum;
+        for (uint i=0;i<values.length;i++) {
+            uint256 d = values[i] > consensus ? values[i] - consensus : consensus - values[i];
+            varSum += d * d;
+        }
+        uint256 variance = varSum / values.length;
+        uint256 std = _sqrt(variance);
+        // 阈值 = λσ
+        uint256 threshold = (lambdaTimes100 * std) / 100;
+        for (uint i=0;i<values.length;i++) {
+            uint256 d = values[i] > consensus ? values[i] - consensus : consensus - values[i];
+            if (d > threshold) count++;
+        }
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) { y = z; z = (x / z + z) / 2; }
+    }
+}
+
