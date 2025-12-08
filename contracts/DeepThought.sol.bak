@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.0 <0.9.0;
+
+/**
+ * @title DeepThought (Oracle/Audit variant)
+ * @dev This contract re-purposes the original DeepThought oracle into
+ *      the audit-after-consensus mechanism required by "oracle":
+ *      1) Observer submits an observation + stake
+ *      2) Proposer finalizes a consensus result
+ *      3) A challenge window opens; a challenger can stake and open an audit
+ *      4) An audit committee is formed; auditors stake and must reach UNANIMOUS decision
+ *      5) Settlement:
+ *          - Not unanimous  -> all auditors are slashed; challenger refunded
+ *          - Unanimous & support original -> challenger slashed (paid to proposer)
+ *          - Unanimous & overturn original -> proposer slashed (paid to challenger)
+ *      Reputation increases for the winning side and decreases for the losing side.
+ *
+ *      NOTE: This contract keeps the original contract name "DeepThought" so that build
+ *      artifacts and scripts do not need to change. All legacy voting/certifying phases
+ *      have been removed in favor of the audit-after-consensus state machine.
+ */
+contract DeepThought {
+    /* ----------- config ----------- */
+    address public owner;
+    address public treasury; // receives slashed funds when specified
+
+    uint256 public minProposerStake = 0.05 ether;
+    uint256 public minChallengerStake = 0.05 ether;
+    uint256 public minAuditorStake   = 0.02 ether;
+
+    uint256 public challengeWindow = 1 days;
+    uint256 public auditWindow     = 1 days;
+
+    /* ----------- reputation ----------- */
+    mapping(address => int256) public reputation;
+
+    /* ----------- proposition model ----------- */
+    enum PropState { None, Submitted, Finalized, Challenged, Auditing, Settled }
+
+    struct Proposition {
+        uint256 id;
+        address proposer;
+        bytes32 observationHash; // observation commitment
+        bytes32 finalResult;     // finalized result commitment
+        uint256 submitTime;
+        uint256 challengeDeadline;
+        uint256 auditDeadline;
+
+        // staking
+        uint256 proposerStake;
+        address challenger;
+        uint256 challengerStake;
+
+        // audit committee
+        address[] committee;
+        mapping(address => bool) isAuditor;
+        mapping(address => bool) auditorJoined;
+        mapping(address => bool) voted;
+        mapping(address => bool) voteAgree; // true means "support original result"
+        mapping(address => uint256) auditorStake;
+        uint256 nAgree;
+        uint256 nDisagree;
+
+        // state
+        PropState state;
+        bool settledSupportOriginal; // settlement outcome
+    }
+
+    mapping(uint256 => Proposition) private props;
+
+    /* ----------- events ----------- */
+    event ObservationSubmitted(uint256 indexed id, address indexed proposer, bytes32 observationHash, uint256 stake);
+    event ConsensusFinalized(uint256 indexed id, bytes32 finalResult, uint256 challengeDeadline);
+    event Challenged(uint256 indexed id, address indexed challenger, uint256 stake, uint256 auditDeadline);
+    event CommitteeFormed(uint256 indexed id, address[] committee);
+    event AuditorJoined(uint256 indexed id, address indexed auditor, uint256 stake);
+    event AuditorVoted(uint256 indexed id, address indexed auditor, bool agree);
+    event Settled(uint256 indexed id, bool supportOriginal, string reason);
+
+    /* ----------- modifiers ----------- */
+    modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    modifier inState(uint256 id, PropState s) { require(props[id].state == s, "bad state"); _; }
+
+    constructor() {
+        owner = msg.sender;
+        treasury = msg.sender;
+    }
+
+    /* ----------- admin config ----------- */
+    function setTreasury(address _treasury) external onlyOwner { treasury = _treasury; }
+    function setWindows(uint256 _challengeWindow, uint256 _auditWindow) external onlyOwner {
+        require(_challengeWindow > 0 && _auditWindow > 0, "bad windows");
+        challengeWindow = _challengeWindow;
+        auditWindow = _auditWindow;
+    }
+    function setMinStakes(uint256 p, uint256 c, uint256 a) external onlyOwner {
+        require(p>0 && c>0 && a>0, "bad stakes");
+        minProposerStake = p; minChallengerStake = c; minAuditorStake = a;
+    }
+
+    /* ----------- proposition lifecycle ----------- */
+
+    // 1) submit observation + stake
+    function submitObservation(uint256 id, bytes32 observationHash) external payable inStateOrNone(id, PropState.None) {
+        require(msg.value >= minProposerStake, "stake too low");
+        Proposition storage P = props[id];
+        require(P.state == PropState.None, "exists");
+        P.id = id;
+        P.proposer = msg.sender;
+        P.observationHash = observationHash;
+        P.submitTime = block.timestamp;
+        P.proposerStake = msg.value;
+        P.state = PropState.Submitted;
+        emit ObservationSubmitted(id, msg.sender, observationHash, msg.value);
+    }
+
+    // 2) finalize consensus result (by proposer for simplicity)
+    function finalizeConsensus(uint256 id, bytes32 finalResult) external inState(id, PropState.Submitted) {
+        Proposition storage P = props[id];
+        require(msg.sender == P.proposer, "only proposer");
+        P.finalResult = finalResult;
+        P.challengeDeadline = block.timestamp + challengeWindow;
+        P.state = PropState.Finalized;
+        emit ConsensusFinalized(id, finalResult, P.challengeDeadline);
+    }
+
+    // allow proposer to settle and reclaim stake if no one challenged within window
+    function settleNoChallenge(uint256 id) external inState(id, PropState.Finalized) {
+        Proposition storage P = props[id];
+        require(block.timestamp > P.challengeDeadline, "challenge window still open");
+        require(P.challenger == address(0), "already challenged");
+        _safeTransfer(payable(P.proposer), P.proposerStake);
+        reputation[P.proposer] += 1;
+        P.proposerStake = 0;
+        P.settledSupportOriginal = true;
+        P.state = PropState.Settled;
+        emit Settled(id, true, "no challenge: proposer stake released");
+    }
+
+    // 3) challenge within window
+    function openChallenge(uint256 id) external payable inState(id, PropState.Finalized) {
+        Proposition storage P = props[id];
+        require(block.timestamp <= P.challengeDeadline, "challenge window closed");
+        require(P.challenger == address(0), "already challenged");
+        require(msg.value >= minChallengerStake, "stake too low");
+        P.challenger = msg.sender;
+        P.challengerStake = msg.value;
+        P.auditDeadline = block.timestamp + auditWindow;
+        P.state = PropState.Challenged;
+        emit Challenged(id, msg.sender, msg.value, P.auditDeadline);
+    }
+
+    // 4) owner sets the committee (deterministic off-chain selection can be mirrored here)
+    function formAuditCommittee(uint256 id, address[] calldata committee) external onlyOwner inState(id, PropState.Challenged) {
+        Proposition storage P = props[id];
+        require(committee.length > 0, "empty committee");
+        P.committee = committee;
+        for (uint i=0; i<committee.length; i++) {
+            P.isAuditor[committee[i]] = true;
+        }
+        P.state = PropState.Auditing;
+        emit CommitteeFormed(id, committee);
+    }
+
+    // auditors must join and stake before voting
+    function auditorJoin(uint256 id) external payable inState(id, PropState.Auditing) {
+        Proposition storage P = props[id];
+        require(P.isAuditor[msg.sender], "not in committee");
+        require(!P.auditorJoined[msg.sender], "already joined");
+        require(msg.value >= minAuditorStake, "stake too low");
+        P.auditorJoined[msg.sender] = true;
+        P.auditorStake[msg.sender] = msg.value;
+        emit AuditorJoined(id, msg.sender, msg.value);
+    }
+
+    // 5) auditors vote; they must reach UNANIMITY
+    function auditorVote(uint256 id, bool agree) external inState(id, PropState.Auditing) {
+        Proposition storage P = props[id];
+        require(P.isAuditor[msg.sender], "not auditor");
+        require(P.auditorJoined[msg.sender], "join first");
+        require(!P.voted[msg.sender], "already voted");
+        P.voted[msg.sender] = true;
+        P.voteAgree[msg.sender] = agree;
+        if (agree) P.nAgree += 1; else P.nDisagree += 1;
+        emit AuditorVoted(id, msg.sender, agree);
+    }
+
+    // anyone can settle after all voted or after deadline
+    function settle(uint256 id) external inState(id, PropState.Auditing) {
+        Proposition storage P = props[id];
+        bool allVoted = (P.nAgree + P.nDisagree) == P.committee.length;
+        require(allVoted || block.timestamp > P.auditDeadline, "too early");
+
+        // Unanimity check
+        bool unanimousAgree = (P.nAgree == P.committee.length && P.committee.length > 0);
+        bool unanimousDisagree = (P.nDisagree == P.committee.length && P.committee.length > 0);
+
+        if (!(unanimousAgree || unanimousDisagree)) {
+            // Not unanimous: punish all auditors; challenger refunded; original result stands
+            _slashAuditorsToTreasury(P);
+            _safeTransfer(payable(P.challenger), P.challengerStake);
+            // reputation updates
+            reputation[P.challenger] += 1;
+            for (uint i=0;i<P.committee.length;i++){ reputation[P.committee[i]] -= 1; }
+            P.settledSupportOriginal = true;
+            emit Settled(id, true, "not-unanimous: auditors slashed, challenger refunded");
+        } else if (unanimousAgree) {
+            // Support original result -> challenger loses
+            _safeTransfer(payable(P.proposer), P.challengerStake);
+            _refundAuditors(P);
+            reputation[P.proposer] += 1;
+            reputation[P.challenger] -= 1;
+            for (uint i=0;i<P.committee.length;i++){ reputation[P.committee[i]] += 1; }
+            P.settledSupportOriginal = true;
+            emit Settled(id, true, "unanimous support original: challenger slashed");
+        } else {
+            // Overturn original -> proposer loses
+            _safeTransfer(payable(P.challenger), P.proposerStake);
+            _refundAuditors(P);
+            reputation[P.proposer] -= 1;
+            reputation[P.challenger] += 1;
+            for (uint i=0;i<P.committee.length;i++){ reputation[P.committee[i]] += 1; }
+            P.settledSupportOriginal = false;
+            emit Settled(id, false, "unanimous overturn: proposer slashed");
+        }
+
+        // finalize
+        P.proposerStake = 0;
+        P.challengerStake = 0;
+        P.state = PropState.Settled;
+    }
+
+    /* ----------- view helpers ----------- */
+    function getCommittee(uint256 id) external view returns (address[] memory) { return props[id].committee; }
+    function getVotes(uint256 id) external view returns (uint256 agree, uint256 disagree){
+        Proposition storage P = props[id]; return (P.nAgree, P.nDisagree);
+    }
+    function stateOf(uint256 id) external view returns (PropState) { return props[id].state; }
+    function outcomeSupportsOriginal(uint256 id) external view returns (bool) { return props[id].settledSupportOriginal; }
+
+    /* ----------- internal helpers ----------- */
+    function _slashAuditorsToTreasury(Proposition storage P) internal {
+        uint256 total;
+        for (uint i=0;i<P.committee.length;i++){
+            address a = P.committee[i];
+            uint256 s = P.auditorStake[a];
+            if (s>0){
+                total += s;
+                P.auditorStake[a] = 0;
+            }
+        }
+        if (total>0) _safeTransfer(payable(treasury), total);
+    }
+
+    function _refundAuditors(Proposition storage P) internal {
+        for (uint i=0;i<P.committee.length;i++){
+            address a = P.committee[i];
+            uint256 s = P.auditorStake[a];
+            if (s>0){ P.auditorStake[a] = 0; _safeTransfer(payable(a), s); }
+        }
+    }
+
+    function _safeTransfer(address payable to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok,) = to.call{value: amount}("");
+        require(ok, "transfer failed");
+    }
+
+    /* ----------- compatibility helper ----------- */
+    // Allow receiving ether (e.g., funding treasury)
+    receive() external payable {}
+    fallback() external payable {}
+
+    /* ----------- custom modifiers ----------- */
+    modifier inStateOrNone(uint256 id, PropState expectedNone) {
+        require(props[id].state == PropState.None, "exists");
+        _;
+    }
+}
+

@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./interfaces/INodeManager.sol";
+import "./interfaces/IIncentiveGovernance.sol";
+import "./interfaces/IDataAggregation.sol";
+import "./interfaces/IDisputeResolution.sol";
+
+contract OracleCore {
+    INodeManager public nodeManager;
+    IIncentiveGovernance public incentives;
+    IDataAggregation public aggregation;
+    IDisputeResolution public disputes;
+
+    enum State { NONE, COMMITTING, REVEALING, FINALIZED }
+
+    struct DataRequest {
+        address proposer;
+        string  spec;
+        State   state;
+        uint256 createdAt;
+        uint256 totalReward;
+
+        address[] observers;
+        mapping(address => bool) isSelected;
+        mapping(address => bool) committed;
+        mapping(address => bool) revealed;
+
+        address[] revealers;
+        uint256[] revealedValues;
+
+        uint256 consensus;
+        uint256 lower;
+        uint256 upper;
+
+        uint256 commitDeadline;
+        uint256 revealDeadline;
+
+        bool settled;
+    }
+
+    uint256 public nextRequestId;
+    mapping(uint256 => DataRequest) public requests;
+
+    // params
+    uint256 public minObserverStake = 0;
+    uint256 public anomalyLambdaTimes100 = 250;
+    uint256 public auditAnomalyRatioTimes100 = 500;
+
+    uint256 public commitDuration = 10 minutes;
+    uint256 public revealDuration = 10 minutes;
+
+    uint256 public baseWeight1e18 = 1e18;
+    uint256 public wRep1e18       = 1e18;
+
+    event RequestCreated(uint256 indexed requestId, address indexed proposer, string spec, uint256 reward);
+    event ObserversSelected(uint256 indexed requestId, address[] observers);
+    event ObservationCommitted(uint256 indexed requestId, address indexed observer, bytes32 commitment);
+    event ObservationRevealed(uint256 indexed requestId, address indexed observer, uint256 value, uint256 nonce);
+    event RequestFinalized(uint256 indexed requestId, uint256 consensus, uint256 lower, uint256 upper);
+    event AuditInitiated(uint256 indexed requestId, uint256 anomalyRatioTimes100);
+    event AnomalyStats(uint256 indexed requestId, uint256 anomalies, uint256 total, uint256 anomalyRatioTimes100);
+    
+    constructor(
+        address _nodeManager,
+        address _incentives,
+        address _aggregation,
+        address _disputes
+    ) {
+        nodeManager  = INodeManager(_nodeManager);
+        incentives   = IIncentiveGovernance(_incentives);
+        aggregation  = IDataAggregation(_aggregation);
+        disputes     = IDisputeResolution(_disputes);
+    }
+
+    function setParams(
+        uint256 _minObserverStake,
+        uint256 _anomalyLambdaTimes100,
+        uint256 _auditAnomalyRatioTimes100
+    ) external {
+        minObserverStake = _minObserverStake;
+        anomalyLambdaTimes100 = _anomalyLambdaTimes100;
+        auditAnomalyRatioTimes100 = _auditAnomalyRatioTimes100;
+    }
+
+    function setTiming(uint256 _commitDuration, uint256 _revealDuration) external {
+        require(_commitDuration > 0 && _revealDuration > 0, "OC: bad durations");
+        commitDuration = _commitDuration;
+        revealDuration = _revealDuration;
+    }
+
+    function setWeightParams(uint256 _baseWeight1e18, uint256 _wRep1e18) external {
+        require(_baseWeight1e18 > 0, "OC: base=0");
+        baseWeight1e18 = _baseWeight1e18;
+        wRep1e18 = _wRep1e18;
+    }
+
+    function createDataRequest(string calldata _spec) external payable returns (uint256 requestId) {
+        require(msg.value > 0, "OC: reward=0");
+        requestId = nextRequestId++;
+        DataRequest storage req = requests[requestId];
+        req.proposer  = msg.sender;
+        req.spec      = _spec;
+        req.state     = State.COMMITTING;
+        req.createdAt = block.timestamp;
+        req.totalReward = msg.value;
+
+        req.commitDeadline = block.timestamp + commitDuration;
+
+        address[] memory obs = nodeManager.selectObservers(minObserverStake);
+        req.observers = obs;
+        for (uint256 i = 0; i < obs.length; i++) {
+            req.isSelected[obs[i]] = true;
+        }
+        emit RequestCreated(requestId, msg.sender, _spec, msg.value);
+        emit ObserversSelected(requestId, obs);
+    }
+
+    function commitData(uint256 _requestId, bytes32 _commitment) external {
+        DataRequest storage req = requests[_requestId];
+        require(req.state == State.COMMITTING, "OC: not committing");
+        require(block.timestamp <= req.commitDeadline, "OC: commit timeout");
+        require(req.isSelected[msg.sender], "OC: not selected");
+        require(!req.committed[msg.sender], "OC: committed");
+
+        aggregation.storeCommitment(_requestId, msg.sender, _commitment);
+        req.committed[msg.sender] = true;
+        emit ObservationCommitted(_requestId, msg.sender, _commitment);
+    }
+
+    function openReveal(uint256 _requestId) external {
+        DataRequest storage req = requests[_requestId];
+        require(req.state == State.COMMITTING, "OC: bad state");
+        require(block.timestamp <= req.commitDeadline, "OC: commit timeout");
+        bool hasCommit;
+        for (uint256 i = 0; i < req.observers.length; i++) {
+            if (req.committed[req.observers[i]]) { hasCommit = true; break; }
+        }
+        require(hasCommit, "OC: no commit");
+        req.state = State.REVEALING;
+        req.revealDeadline = block.timestamp + revealDuration;
+    }
+
+    function revealData(uint256 _requestId, uint256 _value, uint256 _nonce) external {
+        DataRequest storage req = requests[_requestId];
+        require(req.state == State.REVEALING, "OC: not revealing");
+        require(block.timestamp <= req.revealDeadline, "OC: reveal timeout");
+        require(req.isSelected[msg.sender], "OC: not selected");
+        require(req.committed[msg.sender], "OC: not committed");
+        require(!req.revealed[msg.sender], "OC: revealed");
+        require(aggregation.verifyReveal(_requestId, msg.sender, _value, _nonce), "OC: bad reveal");
+
+        req.revealed[msg.sender] = true;
+        req.revealers.push(msg.sender);
+        req.revealedValues.push(_value);
+        emit ObservationRevealed(_requestId, msg.sender, _value, _nonce);
+    }
+
+    function finalizeRequest(uint256 _requestId) external {
+        DataRequest storage req = requests[_requestId];
+        require(
+            (req.state == State.REVEALING) ||
+            (req.state == State.COMMITTING && block.timestamp > req.commitDeadline) ||
+            (req.state == State.REVEALING  && block.timestamp > req.revealDeadline),
+            "OC: not finalizable"
+        );
+        _finalizeRequest(_requestId);
+    }
+
+    function forceFinalize(uint256 _requestId) external {
+        DataRequest storage req = requests[_requestId];
+        require(
+            (req.state == State.COMMITTING && block.timestamp > req.commitDeadline) ||
+            (req.state == State.REVEALING  && block.timestamp > req.revealDeadline),
+            "OC: not due"
+        );
+        _finalizeRequest(_requestId);
+    }
+
+    function _finalizeRequest(uint256 _requestId) internal {
+        DataRequest storage req = requests[_requestId];
+        require(!req.settled, "OC: settled");
+
+        if (req.state == State.COMMITTING) {
+            require(block.timestamp > req.commitDeadline, "OC: not due");
+            req.state = State.REVEALING;
+        }
+
+        uint256 n = req.revealers.length;
+        uint256 total = req.totalReward;
+
+        if (n == 0) {
+            req.consensus = 0;
+            req.lower = 0;
+            req.upper = 0;
+            req.state = State.FINALIZED;
+            req.settled = true;
+            emit RequestFinalized(_requestId, 0, 0, 0);
+            incentives.slashToTreasury{value: total}(_requestId);
+            return;
+        }
+
+        uint256[] memory weights = _collectWeights(req.revealers);
+
+        (uint256 consensus_, uint256 lower_, uint256 upper_) =
+            aggregation.calculateWeightedConsensusWeighted(_requestId, req.revealedValues, weights);
+
+        // 先写状态（CEI）
+        req.consensus = consensus_;
+        req.lower = lower_;
+        req.upper = upper_;
+        req.state = State.FINALIZED;
+        req.settled = true;
+        emit RequestFinalized(_requestId, consensus_, lower_, upper_);
+
+        // 拆到子函数，避免“stack too deep”
+        _payAndRep(_requestId, req, weights, lower_, upper_);
+
+        _maybeTriggerAudit(_requestId, req.revealedValues, consensus_);
+    }
+
+    function _payAndRep(
+        uint256 _requestId,
+        DataRequest storage req,
+        uint256[] memory weights,
+        uint256 lower_,
+        uint256 upper_
+    ) internal {
+        uint256 n = req.revealers.length;
+        uint256 total = req.totalReward;
+
+        address[] memory payees   = new address[](n);
+        uint256[] memory payouts  = new uint256[](n);
+        address[] memory repAddrs = new address[](n);
+        int256[]  memory repDelta = new int256[](n);
+
+        uint256 sumW = 0;
+        for (uint256 i=0;i<n;i++) sumW += weights[i];
+        if (sumW == 0) { for (uint256 i=0;i<n;i++) weights[i]=1; sumW = n; }
+
+        uint256 accSum = 0;
+        for (uint256 i = 0; i < n; i++) {
+            address obs = req.revealers[i];
+            payees[i]   = obs;
+
+            uint256 p = (total * weights[i]) / sumW;
+            payouts[i] = p;
+            accSum += p;
+
+            repAddrs[i] = obs;
+            uint256 val = req.revealedValues[i];
+            repDelta[i] = (val >= lower_ && val <= upper_) ? int256(1) : int256(-1);
+        }
+
+        uint256 rem = total - accSum;
+        if (rem > 0) { payouts[0] += rem; }
+
+        require(address(this).balance >= total, "OC: insufficient balance");
+        incentives.distributeRewards{value: total}(
+            _requestId,
+            payees,
+            payouts,
+            repAddrs,
+            repDelta
+        );
+    }
+
+    function _collectWeights(address[] storage revealers) internal view returns (uint256[] memory weights) {
+        uint256 n = revealers.length;
+        weights = new uint256[](n);
+        for (uint256 i=0;i<n;i++) {
+            address a = revealers[i];
+            int256 rep = incentives.reputation(a);
+            uint256 repPos = rep > 0 ? uint256(rep) : 0;
+            uint256 w = baseWeight1e18 + (wRep1e18 * repPos);
+            if (w == 0) w = 1;
+            weights[i] = w;
+        }
+    }
+
+    function _maybeTriggerAudit(
+        uint256 _requestId,
+        uint256[] storage values,
+        uint256 consensus
+    ) internal {
+        uint256 len = values.length;
+        uint256[] memory mem = new uint256[](len);
+        for (uint256 i=0;i<len;i++) mem[i] = values[i];
+
+        uint256 anomalies = aggregation.detectAnomalies(
+            _requestId,
+            mem,
+            consensus,
+            anomalyLambdaTimes100
+        );
+        if (len > 0) {
+            uint256 ratioTimes100 = anomalies * 10000 / len;
+            if (ratioTimes100 >= auditAnomalyRatioTimes100) {
+                disputes.initiateAudit(_requestId);
+            }
+        }
+    }
+
+    function getObservers(uint256 _requestId) external view returns (address[] memory) {
+        return requests[_requestId].observers;
+    }
+    function getRevealers(uint256 _requestId) external view returns (address[] memory) {
+        return requests[_requestId].revealers;
+    }
+    function isSelectedObserver(uint256 _requestId, address _observer) external view returns (bool) {
+        return requests[_requestId].isSelected[_observer];
+    }
+    function getRequestResult(uint256 requestId) external view returns (uint256, uint256, uint256) {
+        DataRequest storage r = requests[requestId];
+        return (r.consensus, r.lower, r.upper);
+    }
+}
+
