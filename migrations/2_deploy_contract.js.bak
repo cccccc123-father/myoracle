@@ -1,0 +1,31 @@
+const NodeManager = artifacts.require("NodeManager");
+const IncentiveGovernance = artifacts.require("IncentiveGovernance");
+const DataAggregation = artifacts.require("DataAggregation");
+const DisputeResolution = artifacts.require("DisputeResolution");
+const OracleCore = artifacts.require("OracleCore");
+
+module.exports = async function (deployer, network, accounts) {
+  // 1) 依赖合约
+  await deployer.deploy(NodeManager);
+  const node = await NodeManager.deployed();
+
+  await deployer.deploy(IncentiveGovernance, accounts[0]); // treasury = 部署者
+  const inc = await IncentiveGovernance.deployed();
+
+  await deployer.deploy(DataAggregation);
+  const agg = await DataAggregation.deployed();
+
+  // 2) 先用占位 core 地址部署 DR（稍后 setCore）
+  await deployer.deploy(DisputeResolution, accounts[0], node.address);
+  const dr = await DisputeResolution.deployed();
+
+  // 3) 部署 OracleCore（把依赖地址传进去）
+  await deployer.deploy(OracleCore, node.address, inc.address, agg.address, dr.address);
+  const core = await OracleCore.deployed();
+
+  // 4) 回填白名单/引用
+  await inc.setOracleCore(core.address);
+  // 如果你的 DisputeResolution.sol 里加了 setCore(address)
+  if (dr.setCore) await dr.setCore(core.address);
+};
+
